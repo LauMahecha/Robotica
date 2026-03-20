@@ -1,0 +1,198 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
+import numpy as np
+import math
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+# --- NODO DE ROS 2 ---
+class ScaraNode(Node):
+    def __init__(self):
+        super().__init__('scara_gui_node')
+        self.joint_pub = self.create_publisher(JointState, 'joint_states', 10)
+        self.trajectory_pub = self.create_publisher(JointTrajectory, '/arm_controller/joint_trajectory', 10)
+
+    def publicar_articulaciones(self, q1_rad, q2_rad, d3_metros):
+        # RViz
+        msg_state = JointState()
+        msg_state.header.stamp = self.get_clock().now().to_msg()
+        msg_state.name = ['Join_1', 'Joint_2', 'Joint_3']
+        msg_state.position = [float(q1_rad), float(q2_rad), -float(d3_metros)]
+        self.joint_pub.publish(msg_state)
+
+        # Gazebo
+        msg_traj = JointTrajectory()
+        msg_traj.joint_names = ['Join_1', 'Joint_2', 'Joint_3']
+        punto = JointTrajectoryPoint()
+        punto.positions = [float(q1_rad), float(q2_rad), -float(d3_metros)]
+        punto.time_from_start = Duration(sec=0, nanosec=200000000) 
+        msg_traj.points.append(punto)
+        self.trajectory_pub.publish(msg_traj)
+
+# --- INTERFAZ GRÁFICA ---
+class ScaraGui:
+    def __init__(self, root, ros_node):
+        self.root = root
+        self.ros_node = ros_node
+        self.root.title("SCARA Pro: Directa + Inversa")
+        
+        # Parámetros mecánicos (según tu código)
+        self.a1 = 112.0
+        self.a2 = 155.0
+        self.L_base = 200.0 # Altura de la base en mm
+        
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(padx=20, pady=20)
+        
+        # --- PANEL IZQUIERDO (CONTROLES) ---
+        ctrl_frame = tk.Frame(main_frame)
+        ctrl_frame.grid(row=0, column=0, sticky="ns")
+
+        # 1. Cinemática Directa
+        dir_frame = tk.LabelFrame(ctrl_frame, text=" Cinemática Directa (Manual) ", padx=10, pady=10)
+        dir_frame.pack(fill="x", pady=5)
+        
+        self.t1_val = tk.DoubleVar(value=0)
+        self.t2_val = tk.DoubleVar(value=0)
+        self.d3_val = tk.DoubleVar(value=0)
+        
+        self.create_control(dir_frame, "Theta 1 (°):", self.t1_val, -180, 180, 0)
+        self.create_control(dir_frame, "Theta 2 (°):", self.t2_val, -180, 180, 1)
+        self.create_control(dir_frame, "Distancia d3 (mm):", self.d3_val, 0, 60.5, 2)
+
+        # 2. Cinemática Inversa
+        inv_frame = tk.LabelFrame(ctrl_frame, text=" Cinemática Inversa (XYZ) ", padx=10, pady=10, fg="blue")
+        inv_frame.pack(fill="x", pady=5)
+        
+        tk.Label(inv_frame, text="X (mm):").grid(row=0, column=0)
+        self.ent_x = tk.Entry(inv_frame, width=8); self.ent_x.grid(row=0, column=1)
+        
+        tk.Label(inv_frame, text="Y (mm):").grid(row=1, column=0)
+        self.ent_y = tk.Entry(inv_frame, width=8); self.ent_y.grid(row=1, column=1)
+        
+        tk.Label(inv_frame, text="Z (mm):").grid(row=2, column=0)
+        self.ent_z = tk.Entry(inv_frame, width=8); self.ent_z.grid(row=2, column=1)
+
+        btn_inv = tk.Button(inv_frame, text="Calcular y Mover", command=self.ejecutar_inversa, bg="lightgreen")
+        btn_inv.grid(row=3, column=0, columnspan=2, pady=10)
+        
+        # Info de matrices
+        self.matrix_text = tk.Text(ctrl_frame, height=8, width=40, font=("Courier", 9))
+        self.matrix_text.pack(pady=10)
+        
+        # --- PANEL DERECHO (PLOT) ---
+        self.fig = Figure(figsize=(5, 5), dpi=100)
+        self.ax = self.fig.add_subplot(111, projection='3d')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=main_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=1)
+        
+        self.update_plot()
+
+    def create_control(self, frame, label, var, min_v, max_v, row):
+        tk.Label(frame, text=label).grid(row=row*2, column=0, sticky="w")
+        slider = ttk.Scale(frame, from_=min_v, to=max_v, variable=var, orient="horizontal", length=180, command=lambda x: self.update_plot())
+        slider.grid(row=row*2+1, column=0)
+        entry = tk.Entry(frame, textvariable=var, width=8)
+        entry.grid(row=row*2+1, column=1)
+
+    def ejecutar_inversa(self):
+        try:
+            x = float(self.ent_x.get())
+            y = float(self.ent_y.get())
+            z = float(self.ent_z.get())
+            
+            # Matematicas de la Inversa (IK)
+            r_sq = x**2 + y**2
+            r = math.sqrt(r_sq)
+            
+            # Verificación de alcance
+            if r > (self.a1 + self.a2) or r < abs(self.a1 - self.a2):
+                messagebox.showerror("Error", "Punto fuera de alcance")
+                return
+
+            # Ley de cosenos para Theta 2
+            cos_t2 = (r_sq - self.a1**2 - self.a2**2) / (2 * self.a1 * self.a2)
+            t2 = math.acos(max(min(cos_t2, 1.0), -1.0))
+            
+            # Theta 1
+            t1 = math.atan2(y, x) - math.atan2(self.a2 * math.sin(t2), self.a1 + self.a2 * math.cos(t2))
+            
+            # Distancia d3 (Basado en tu L_base=200)
+            # Si el robot está en 200mm es d3=0. Si baja a 140mm es d3=60.
+            d3 = self.L_base - z
+            
+            if d3 < 0 or d3 > 60.5:
+                messagebox.showwarning("Atención", f"Z fuera de rango (mm). d3 calculado: {d3:.2f}")
+                d3 = max(0, min(d3, 60.5))
+
+            # Actualizar Sliders (esto dispara update_plot automáticamente)
+            self.t1_val.set(round(math.degrees(t1), 2))
+            self.t2_val.set(round(math.degrees(t2), 2))
+            self.d3_val.set(round(d3, 2))
+            self.update_plot()
+
+        except Exception as e:
+            messagebox.showerror("Error", "Revisa los valores de X, Y, Z")
+
+    def calcular_matrices(self, t1, t2, d3):
+        # Tus matrices originales
+        A1 = np.array([
+            [np.cos(t1), -np.sin(t1), 0, self.a1*np.cos(t1)],
+            [np.sin(t1),  np.cos(t1), 0, self.a1*np.sin(t1)],
+            [0,           0,          1, self.L_base],
+            [0,           0,          0, 1]
+        ])
+        A2 = np.array([
+            [np.cos(t2), np.sin(t2),  0, self.a2*np.cos(t2)],
+            [np.sin(t2), -np.cos(t2), 0, self.a2*np.sin(t2)],
+            [0,           0,         -1, 0],
+            [0,           0,          0, 1]
+        ])
+        A3 = np.array([
+            [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d3], [0, 0, 0, 1]
+        ])
+        return A1, A1 @ A2, A1 @ A2 @ A3
+
+    def update_plot(self):
+        t1_rad = np.radians(self.t1_val.get())
+        t2_rad = np.radians(self.t2_val.get())
+        d3_mm = self.d3_val.get()
+        d3_m = d3_mm / 1000.0
+        
+        if self.ros_node:
+            self.ros_node.publicar_articulaciones(t1_rad, t2_rad, d3_m)
+            
+        T01, T02, T03 = self.calcular_matrices(t1_rad, t2_rad, d3_mm)
+        p0, p1, p2, p3 = [0, 0, 0], T01[:3, 3], T02[:3, 3], T03[:3, 3]
+        
+        self.ax.clear()
+        self.ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]], 'ro-', lw=3)
+        self.ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], 'go-', lw=3)
+        self.ax.plot([p2[0], p3[0]], [p2[1], p3[1]], [p2[2], p3[2]], 'bo-', lw=5)
+        
+        limit = 300
+        self.ax.set_xlim(-limit, limit); self.ax.set_ylim(-limit, limit); self.ax.set_zlim(0, 300)
+        
+        self.matrix_text.delete(1.0, tk.END)
+        self.matrix_text.insert(tk.END, f"Posición Actual:\nX: {p3[0]:.2f} mm\nY: {p3[1]:.2f} mm\nZ: {p3[2]:.2f} mm")
+        self.canvas.draw()
+
+def main(args=None):
+    rclpy.init(args=args)
+    ros_node = ScaraNode()
+    spin_thread = threading.Thread(target=lambda: rclpy.spin(ros_node), daemon=True)
+    spin_thread.start()
+    
+    root = tk.Tk()
+    app = ScaraGui(root, ros_node)
+    root.mainloop()
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
